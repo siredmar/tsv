@@ -207,47 +207,14 @@ HAVING max(time) >= ago(1h)`,
 			want: false,
 		},
 		{
-			desc:  "Free /data for devices (with \\n chars)",
-			input: `SELECT\n  device AS \"Device\",\n  MIN(measure_value::double/1024/1024) AS \"Free /data [MB]\" \nFROM\n  \"ds-metric-forward\".\"metrics\"\nWHERE\n  time BETWEEN from_milliseconds(1755664656155) AND from_milliseconds(1755668256155)\n  AND measure_value::double < 1024000000\n  AND measure_name = 'gridx.ds.system.storage./data.available'\nGROUP BY\n  device\nORDER BY\n  device`,
+			desc:  "Free /data for devices",
+			input: `SELECT   device AS \"Device\",   MIN(measure_value::double/1024/1024) AS \"Free /data [MB]\"  FROM   \"ds-metric-forward\".\"metrics\" WHERE   time BETWEEN from_milliseconds(1755664656155) AND from_milliseconds(1755668256155)   AND measure_value::double < 1024000000   AND measure_name = 'gridx.ds.system.storage./data.available' GROUP BY   device ORDER BY   device`,
 			want:  true,
 		},
 		{
-			desc:  "Free /data for devices (wich \\n chars, timefilter missing)",
-			input: `SELECT\n  device AS \"Device\",\n  MIN(measure_value::double/1024/1024) AS \"Free /data [MB]\" \nFROM\n  \"ds-metric-forward\".\"metrics\"\nWHERE\n AND measure_value::double < 1024000000\n  AND measure_name = 'gridx.ds.system.storage./data.available'\nGROUP BY\n  device\nORDER BY\n  device`,
+			desc:  "Free /data for devices (timefilter missing)",
+			input: `SELECT   device AS \"Device\",   MIN(measure_value::double/1024/1024) AS \"Free /data [MB]\"  FROM   \"ds-metric-forward\".\"metrics\" WHERE  AND measure_value::double < 1024000000   AND measure_name = 'gridx.ds.system.storage./data.available' GROUP BY   device ORDER BY   device`,
 			want:  false,
-		},
-		{
-			desc: "Free /data for devices (newlines)",
-			input: `SELECT
-  device AS "Device",
-  MIN(measure_value::double/1024/1024) AS "Free /data [MB]" 
-FROM
-  $__database.$__table
-WHERE
-  $__timeFilter
-  AND measure_value::double < 1024000000
-  AND measure_name = '$__measure'
-GROUP BY
-  device
-ORDER BY
-  device`,
-			want: true,
-		},
-		{
-			desc: "Free /data for devices (newlines, time filter missing)",
-			input: `SELECT
-  device AS "Device",
-  MIN(measure_value::double/1024/1024) AS "Free /data [MB]" 
-FROM
-  $__database.$__table
-WHERE
-  AND measure_value::double < 1024000000
-  AND measure_name = '$__measure'
-GROUP BY
-  device
-ORDER BY
-  device`,
-			want: false,
 		},
 	}
 
