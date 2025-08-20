@@ -8,12 +8,16 @@ package tsv
 //   - We lex tokens, track parentheses depth, and find SELECT blocks.
 //   - For each SELECT, we locate FROM and WHERE at the same depth.
 //   - A SELECT is considered "hits DB" if the FROM source looks like a base
-//     table name (db.table or "db"."table"). If it's just an alias (e.g. a),
-//     or starts with '(' (subquery), we skip it at that level; inner SELECTs
-//     are validated separately.
+//     table name (db.table, "db"."table", or macros like $__database.$__table).
+//     If it's just an alias (e.g. a), or starts with '(' (subquery), we skip it
+//     at that level; inner SELECTs are validated separately.
 //   - A valid time filter is any predicate in WHERE that references one of
 //     the allowed time columns (default: time, measure_time) and uses BETWEEN
 //     (with optional NOT) or comparison operators (=, <, <=, >, >=, <>, !=).
+//   - WHERE also counts as valid if it contains the Grafana macro $__timeFilter
+//     (case-insensitive; we lowercase tokens).
+//
+// Note: This is intentionally heuristic and aims to be practical for Timestream.
 
 import (
 	"strings"
@@ -27,11 +31,8 @@ type Options struct {
 }
 
 type Issue struct {
-	// Snippet is a short excerpt of the offending SELECT (lowercased, trimmed).
 	Snippet string
-	// Reason explains why validation failed for this SELECT.
-	Reason string
-	// AtDepth is the parentheses nesting depth where the SELECT was found (debugging aid).
+	Reason  string
 	AtDepth int
 }
 
@@ -46,12 +47,11 @@ func Validate(sql string, opts *Options) (bool, []Issue) {
 		}
 	}
 
-	// Preprocess: strip comments, then lex.
 	src := stripComments(sql)
 	toks := lex(src)
 
 	type sel struct {
-		selIdx int // index into toks where "select" appears
+		selIdx int
 		depth  int
 	}
 	var selects []sel
@@ -71,19 +71,17 @@ func Validate(sql string, opts *Options) (bool, []Issue) {
 			continue
 		}
 
-		// Determine the span of the FROM clause (until GROUP/ORDER/HAVING/UNION/INTERSECT/EXCEPT,
-		// or when the block closes: depth drops below this select's depth).
+		// FROM clause ends at next clause keyword (excluding WHERE) or when depth drops.
 		stopIdx := findNextTerminatorAtDepth(toks, fromIdx+1, s.depth)
 
-		// Decide if this SELECT directly reads from a base table (not a subquery-first source or CTE alias).
+		// Decide if this SELECT directly reads from a base table (not subquery or CTE alias).
 		hitsDB := fromStartsWithBaseTable(toks, fromIdx+1, stopIdx, s.depth)
-
-		// If it doesn't hit DB at this level, inner SELECTs (if any) will be validated separately.
 		if !hitsDB {
+			// Outer SELECT over CTE/derived table — inner SELECTs will be validated separately.
 			continue
 		}
 
-		// Must have WHERE at same depth between FROM and the terminator (or end of statement).
+		// WHERE must be present at same depth between FROM and its terminator.
 		whereIdx := findNextKeywordBetweenAtDepth(toks, fromIdx+1, stopIdx, s.depth, "where")
 		if whereIdx == -1 {
 			issues = append(issues, Issue{
@@ -94,10 +92,20 @@ func Validate(sql string, opts *Options) (bool, []Issue) {
 			continue
 		}
 
-		// WHERE span: from whereIdx+1 until next clause keyword or terminator at same depth,
-		// or when block closes (depth drops below this select's depth).
+		// WHERE body ends at next clause (group/order/having/union/...) or on depth drop.
 		whereStop := findNextTerminatorAtDepth(toks, whereIdx+1, s.depth)
 
+		// Malformed WHERE like "WHERE\n AND ..." (no predicate before conjunction) should fail.
+		if whereStartsWithConjunction(toks, whereIdx+1, whereStop, s.depth) {
+			issues = append(issues, Issue{
+				Snippet: snippetAroundTokens(toks, s.selIdx, whereStop),
+				Reason:  "WHERE clause starts with AND/OR; no predicate before it",
+				AtDepth: s.depth,
+			})
+			continue
+		}
+
+		// Check for time predicate or $__timeFilter macro.
 		if !whereHasTimePredicate(toks, whereIdx+1, whereStop, s.depth, timeCols) {
 			issues = append(issues, Issue{
 				Snippet: snippetAroundTokens(toks, s.selIdx, whereStop),
@@ -177,7 +185,7 @@ func lex(s string) []token {
 		j := i + 1
 		for j < len(s) {
 			if s[j] == quote {
-				// handle escaped '' (SQL) or "" inside quoted identifiers
+				// handle escaped '' or "" inside literals/quoted idents
 				if j+1 < len(s) && s[j+1] == quote {
 					j += 2
 					continue
@@ -191,12 +199,28 @@ func lex(s string) []token {
 
 	for i := 0; i < len(s); {
 		r := s[i]
+
+		// Handle literal escape sequences often present in serialized SQL (e.g., "\n", \"Device\")
+		if r == '\\' && i+1 < len(s) {
+			switch s[i+1] {
+			case 'n', 'r', 't':
+				// treat as whitespace: skip both
+				i += 2
+				continue
+			case '"', '\'', '\\':
+				// skip the backslash; next loop will process the quoted char
+				i++
+				continue
+			}
+			// fall through: treat '\' as a symbol if not a known escape
+		}
+
 		// whitespace
 		if unicode.IsSpace(rune(r)) {
 			i++
 			continue
 		}
-		// parentheses adjust depth (emit as symbol)
+		// parentheses adjust depth
 		if r == '(' {
 			out = append(out, token{val: "(", kind: tkSymbol, depth: depth})
 			depth++
@@ -212,15 +236,14 @@ func lex(s string) []token {
 			i++
 			continue
 		}
-		// strings: single quotes = literals, double quotes = quoted identifiers in many SQL dialects
+		// strings / quoted identifiers
 		if r == '\'' || r == '"' {
 			str, nx := readString(i, r)
-			kind := tkString
-			// Treat quoted identifiers (") as identifiers to help FROM/column detection.
 			if r == '"' {
+				// treat "ident" as identifier (lowercased, quotes kept for context)
 				out = append(out, token{val: strings.ToLower(str), kind: tkIdent, depth: depth})
 			} else {
-				out = append(out, token{val: str, kind: kind, depth: depth})
+				out = append(out, token{val: str, kind: tkString, depth: depth})
 			}
 			i = nx
 			continue
@@ -235,7 +258,7 @@ func lex(s string) []token {
 			i = j
 			continue
 		}
-		// identifiers / keywords (include dots and $ to allow db.schema.table, functions, etc.)
+		// identifiers / keywords
 		if isIdentStart(r) {
 			j := i + 1
 			for j < len(s) && isIdentPart(s[j]) {
@@ -259,14 +282,15 @@ func lex(s string) []token {
 				continue
 			}
 		}
-		// single-char symbols/operators (including =, <, >, ., , etc.)
+		// single-char symbols
 		out = append(out, token{val: strings.ToLower(string(r)), kind: tkSymbol, depth: depth})
 		i++
 	}
 	return out
 }
 
-func isIdentStart(b byte) bool { return unicode.IsLetter(rune(b)) || b == '_' }
+// allow '$' so macros like $__database.$__table and $__timeFilter tokenize as identifiers
+func isIdentStart(b byte) bool { return unicode.IsLetter(rune(b)) || b == '_' || b == '$' }
 func isIdentPart(b byte) bool {
 	return unicode.IsLetter(rune(b)) || unicode.IsDigit(rune(b)) || b == '_' || b == '.' || b == '$'
 }
@@ -304,10 +328,8 @@ func findNextKeywordBetweenAtDepth(toks []token, start, stop, depth int, word st
 	return -1
 }
 
-// IMPORTANT: Do NOT treat WHERE as a terminator when scanning FROM.
-// We want to be able to find WHERE after scanning the FROM block.
-// However, if the block closes (depth drops below 'depth'), we must stop
-// to avoid bleeding into the following CTE/subquery.
+// Do NOT treat WHERE as a terminator when scanning FROM.
+// Terminate on other clause keywords at same depth or when the depth drops.
 func findNextTerminatorAtDepth(toks []token, start, depth int) int {
 	for i := start; i < len(toks); i++ {
 		// Block ended (e.g., we hit a closing parenthesis).
@@ -325,27 +347,49 @@ func findNextTerminatorAtDepth(toks []token, start, depth int) int {
 	return len(toks)
 }
 
-// fromStartsWithBaseTable returns true if FROM's first source token at this depth
-// looks like a base table name (db.table or "db"."table"), not a subquery '(',
-// not a function call, and not just a CTE alias (single identifier without dot).
+// Returns true if FROM's first source at this depth looks like a base table:
+//   - single identifier containing a dot (db.table or $__db.$__table) and not a function call
+//   - pattern: ident '.' ident  (covers "db"."table" and unquoted db.table split into parts)
+//
+// Skips over stray symbols/keywords (e.g., serialized "\n").
+// Returns false for '(' (subquery) or single-part identifier (likely CTE alias).
 func fromStartsWithBaseTable(toks []token, start, stop, depth int) bool {
 	i := start
-	// find first token at same depth
-	for i < stop && i < len(toks) && toks[i].depth != depth {
-		i++
+
+	// Advance to first meaningful token at this depth
+	for i < stop && i < len(toks) {
+		if toks[i].depth != depth {
+			i++
+			continue
+		}
+		// Skip stray symbols except '(' (which indicates subquery).
+		if toks[i].kind == tkSymbol {
+			if toks[i].val == "(" {
+				return false
+			}
+			i++
+			continue
+		}
+		// Skip keywords like LATERAL/AS/ON etc. If we hit SELECT, it's a subquery-ish form.
+		if toks[i].kind == tkKeyword {
+			if toks[i].val == "select" {
+				return false
+			}
+			i++
+			continue
+		}
+		break
 	}
+
 	if i >= stop || i >= len(toks) {
 		return false
 	}
-	// '(' means subquery/derived table
-	if toks[i].kind == tkSymbol && toks[i].val == "(" {
-		return false
-	}
-	// First ident?
+
+	// identifier?
 	if toks[i].kind == tkIdent {
-		// If ident contains '.', assume qualified name -> base table.
+		// ident containing '.' => qualified name (db.table or $__db.$__table)
 		if strings.Contains(stripQuotes(toks[i].val), ".") {
-			// Ensure it's not immediately a function call (name(...))
+			// Ensure it's not immediately a function call ident(...)
 			j := i + 1
 			for j < stop && toks[j].depth != depth {
 				j++
@@ -355,36 +399,79 @@ func fromStartsWithBaseTable(toks []token, start, stop, depth int) bool {
 			}
 			return true
 		}
-		// If pattern is ident '.' ident (for quoted identifiers), treat as table.
+		// ident '.' ident (covers "db"."table" or db . table)
 		if i+2 < stop &&
 			toks[i+1].depth == depth && toks[i+1].kind == tkSymbol && toks[i+1].val == "." &&
 			toks[i+2].depth == depth && toks[i+2].kind == tkIdent {
 			return true
 		}
-		// Single-part identifier (e.g., alias/CTE name) -> assume NOT a base table.
+		// Single-part identifier => likely CTE alias; not base table.
 		return false
 	}
+
 	return false
+}
+
+// True if WHERE body is empty or begins with AND/OR (malformed "WHERE\n AND ...").
+// Skips stray serialized escape tokens like "\n" (backslash + 'n').
+func whereStartsWithConjunction(toks []token, start, stop, depth int) bool {
+	// find first meaningful token at this depth
+	i := start
+	for i < stop && i < len(toks) {
+		if toks[i].depth != depth {
+			i++
+			continue
+		}
+		// Skip serialized escape pair "\n"
+		if toks[i].kind == tkSymbol && toks[i].val == `\` {
+			// if next token is 'n' identifier, skip both
+			if i+1 < stop && toks[i+1].depth == depth && toks[i+1].kind == tkIdent && toks[i+1].val == "n" {
+				i += 2
+				continue
+			}
+			// otherwise just skip the stray symbol
+			i++
+			continue
+		}
+		// Skip other stray symbols at this depth
+		if toks[i].kind == tkSymbol {
+			i++
+			continue
+		}
+		break
+	}
+	if i >= stop || i >= len(toks) {
+		return true // empty WHERE body
+	}
+	return toks[i].kind == tkKeyword && (toks[i].val == "and" || toks[i].val == "or")
 }
 
 func whereHasTimePredicate(toks []token, start, stop, depth int, timeCols []string) bool {
 	if stop < 0 {
 		stop = len(toks)
 	}
+	// Accept Grafana $__timeFilter macro anywhere in WHERE.
+	for i := start; i < stop && i < len(toks); i++ {
+		if toks[i].depth != depth {
+			continue
+		}
+		if toks[i].kind == tkIdent && strings.Contains(toks[i].val, "$__timefilter") {
+			return true
+		}
+	}
+
 	for i := start; i < stop && i < len(toks); i++ {
 		if toks[i].depth != depth {
 			continue
 		}
 
-		// Check for simple comparison on time column:
+		// Simple comparisons: time [op] ...
 		if ok, _ := isTimeIdentifierAt(toks, i, depth, timeCols); ok {
-			// Look ahead for operator at same depth (optionally allow NOT before BETWEEN).
 			j := i + 1
-			// skip any non-depth tokens
 			for j < stop && toks[j].depth != depth {
 				j++
 			}
-			// If NOT BETWEEN pattern: time NOT BETWEEN ...
+			// NOT BETWEEN
 			if j < stop && toks[j].kind == tkKeyword && toks[j].val == "not" {
 				k := j + 1
 				for k < stop && toks[k].depth != depth {
@@ -394,19 +481,18 @@ func whereHasTimePredicate(toks []token, start, stop, depth int, timeCols []stri
 					return true
 				}
 			}
-			// If BETWEEN pattern: time BETWEEN ...
+			// BETWEEN
 			if j < stop && toks[j].kind == tkKeyword && toks[j].val == "between" {
 				return true
 			}
-			// Comparison operator pattern
+			// Comparison operator
 			if j < stop && toks[j].kind == tkSymbol && isCompareOp(toks[j].val) {
 				return true
 			}
 		}
 
-		// Also handle encountering BETWEEN first, then look back for time column within a small window.
+		// BETWEEN first, then look back for time column
 		if toks[i].kind == tkKeyword && toks[i].val == "between" {
-			// Look left within a small window for a time identifier (consider optional NOT).
 			for k := i - 1; k >= start && k >= i-6; k-- {
 				if toks[k].depth != depth {
 					continue
@@ -439,8 +525,7 @@ func stripQuotes(s string) string {
 }
 
 // isTimeIdentifierAt checks if tokens at position i denote a time column.
-// It supports forms: time, measure_time, alias.time, "alias"."time", and ident tokens
-// that already contain a dot (e.g., s1.time).
+// Supports: time, measure_time, alias.time, "alias"."time", and ident tokens with dot (e.g., s1.time).
 func isTimeIdentifierAt(toks []token, i, depth int, timeCols []string) (bool, string) {
 	if i < 0 || i >= len(toks) {
 		return false, ""
@@ -449,10 +534,9 @@ func isTimeIdentifierAt(toks []token, i, depth int, timeCols []string) (bool, st
 		return false, ""
 	}
 
-	// Normalize this identifier (strip quotes).
 	cur := stripQuotes(toks[i].val)
 
-	// If token already contains a dot (e.g., s1.time), check the last part.
+	// ident containing dot
 	if strings.Contains(cur, ".") {
 		last := cur[strings.LastIndex(cur, ".")+1:]
 		if inStrSlice(last, timeCols) {
@@ -460,7 +544,7 @@ func isTimeIdentifierAt(toks []token, i, depth int, timeCols []string) (bool, st
 		}
 	}
 
-	// Pattern: ident '.' ident (handles "s1"."time")
+	// ident '.' ident (handles "s1"."time")
 	if i+2 < len(toks) &&
 		toks[i+1].depth == depth && toks[i+1].kind == tkSymbol && toks[i+1].val == "." &&
 		toks[i+2].depth == depth && toks[i+2].kind == tkIdent {
@@ -470,7 +554,7 @@ func isTimeIdentifierAt(toks []token, i, depth int, timeCols []string) (bool, st
 		}
 	}
 
-	// Single-part identifier: compare directly.
+	// single-part identifier
 	if inStrSlice(cur, timeCols) {
 		return true, cur
 	}
